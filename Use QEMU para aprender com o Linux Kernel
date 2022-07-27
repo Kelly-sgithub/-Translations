@@ -1,0 +1,386 @@
+---
+layout: post
+title:  "Use QEMU para aprender com o Linux Kernel"
+date:   2019-02-15
+published: true
+categories: others
+redirect_from: /others/2019/02/15/use-qemu-to-play-with-linux
+author: siqueira
+lang: en
+excerpt_separator: <!--end-abstract-->
+---
+
+Esse tutorial oferece um guia para montar sua QEMU VM. Primeiro, abordamos
+problemas básicos de instalação. Então explicamos como usar ferramentas básicas do
+QEMU. Por fim. mostramos como configurar o ssh e compartilhar um diretório.
+
+<!--end-abstract-->
+
+{% include add_ref.html id="qemuArch"
+    title="QEMU Arch Wiki"
+    url="https://wiki.archlinux.org/index.php/QEMU" %}
+
+{% include add_ref.html id="qemuDebian"
+    title="QEMU Debian Wiki"
+    url="https://wiki.debian.org/QEMU#Installation" %}
+
+{% include add_ref.html id="qemu"
+    title="QEMU Official Website"
+    url="https://www.qemu.org/" %}
+
+{% include add_ref.html id="sshDo"
+    title="How To Set Up SSH Keys"
+    date="2012-06-22"
+    author="Etel Sverdlov"
+    url="https://www.digitalocean.com/community/tutorials/how-to-set-up-ssh-keys--2" %}
+
+{% include add_ref.html id="kernelVM"
+    title="Kernel-based Virtual Machine"
+    url="https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine" %}
+
+{% include add_ref.html id="installArch"
+    title="Installation guide"
+    url="https://wiki.archlinux.org/index.php/installation_guide" %}
+
+{% include add_ref.html id="installArch2"
+    title="How to Install Arch Linux [Step by Step Guide]"
+    url="https://itsfoss.com/install-arch-linux/" %}
+
+{% include add_ref.html id="nocowFlag"
+    title="Disk Images ─ QEMU documentation"
+    url="https://qemu.readthedocs.io/en/latest/system/images.html#cmdoption-qcow2-arg-nocow" %}
+
+{% include add_ref.html id="kvmSupport"
+    title="KVM Arch Wiki"
+    url="https://wiki.archlinux.org/title/KVM#Checking_support_for_KVM" %}
+
+{% include add_ref.html id="kernelParameters"
+    title="Kernel parameters Arch Wiki"
+    url="https://wiki.archlinux.org/title/Kernel_parameters" %}
+
+## Sumario de comandos
+
+Se você ainda não leu este tutorial, pule esta seção. Eu adicionei esta seção
+como um resumo para alguém que já leu este tutorial e quer apenas lembrar os comandos específicos.
+{: .info}
+
+```bash
+qemu-img create -f qcow2 [IMAGE-NAME] 15G
+
+qemu-system-x86_64 -enable-kvm -cdrom ~/PATH/DISTRO_ISO.iso -boot order=d -drive \
+                file=[NAME],format=qcow2 -m 2G
+
+qemu-system-x86_64 -enable-kvm -nic user,hostfwd=tcp::2222-:22,smb=/PATH/TO/YOUR/SHARED/FOLDER \
+                   -daemonize -m 4G -smp cores=4,cpus=4 [IMAGE-NAME]
+```
+
+## Introdução
+
+Se você tem curiosidade sobre o desenvolvimento do Kernel Linux, mas tem medo de quebrar acidentalmente seu sistema devido a experimentos, a solução para esses problemas pode ser resumida em uma tecnologia: Máquina Virtual (VM). Neste tutorial aprenderemos como usar uma poderosa ferramenta de virtualização de hardware chamada QEMU. Eu aprecio particularmente o QEMU porque é uma ferramenta muito popular (assim é fácil encontrar informações sobre ele na internet), é continuamente atualizada, possui emulação de máquina rica, é software livre e foi inicialmente projetado para desenvolvimento.
+
+QEMU é um emulador de máquina genérico baseado na tradução dinâmica
+{% include cite.html id="qemu" %} que pode operar em dois modos diferentes
+{% include cite.html id="qemuDebian" %}:
+
+* **Emulação completa do sistema**: um modo que emula completamente um computador. Ele pode ser usado para lançar diferentes sistemas operacionais (SO);
+* **Emulação do modo de usuário**: Permite iniciar o processo para um tipo de CPU para outra CPU.
+
+Se você possui uma máquina com arquitetura `x86`, pode usar o QEMU com KVM e obter alto desempenho.
+
+Tenha em mente que devemos evitar trabalhar dentro da VM, pois é um desperdício de recursos computacionais. Queremos trabalhar o máximo possível dentro do host e usar a VM apenas para testar; por isso e para tomar nosso ambiente de trabalho confortável, precisamos;
+
+* acesso SSH;
+* compartilhar um diretório entre host e a VM.
+
+Finalmente, observe atentamente a Figura 1 para obter uma visão geral do fluxo de trabalho adotado para este tutorial.
+
+{% include add_image.html
+   src="guest_host.png"
+   style="width: 50%"
+   caption="Figure 1: Workflow" %}
+
+**Informações:**
+Caso encontre algum problema com este tutorial, por favor me avise. Ficarei feliz em consertar.
+{: .info}
+
+## Observações
+
+Nesse tutorial, trabalharemos dentro e fora da máquina virtual, para facilitar, adicionaremos o seguinte comentários em cima de cada comando:
+
+* `@VM`: Execute o comando dentro da VM.
+* `@HOST`: Execute o comando em sua máquina virtual.
+
+## Pré-requisitos: instalando QEMU, KVM e Openssh
+
+Para seguir com esse tutorial, você precisa instalar QEMU e Samba Client (samba é necessário para compartilhar diretórios entre a máquina virtual e principal).
+
+### &rarr; No Arch Linux {% include cite.html id="qemuArch" %}:
+
+```bash
+# @HOST
+sudo pacman -S qemu qemu-arch-extra samba openssh
+```
+
+### &rarr; No Debian {% include cite.html id="qemuDebian" %}:
+
+```bash
+# @HOST
+sudo apt install qemu samba samba-client openssh
+```
+
+## Criando a imagem
+
+Queremos que o QEMU execute uma distribuição linus para os nosso futuros experimentos com Linux. Com este objetivo em mente, temos que criar um disco de imagem como o seguinte comando:
+
+```bash
+# @HOST
+qemu-img create -f qcow2 [IMAGE-NAME] 15G
+```
+
+**Atenção:**
+Não copie e cole cegamente os comandos acima ou qualquer outro neste tutorial, tente entendê-lo, lendo a breve descrição abaixo do comando e examinando a documentação.
+{: .warning}
+
+* `qemu-img`: É o utilitário de imagem de disco fornecido pelo QEMU;
+  * `create`: Indica que queremos criar uma nova imagem de disco, você pode adicionar opções para habilitar ou desabilitar recursos;
+  * `-f qcow2`: Especifica o formato da imagem; geralmente, você quer ‘raw’ ou ‘qcow2. As imagens brutas são rápidas, mas utilizam todo o tamanho determinado de uma só vez; por outro lado, qcow2 é um pouco mais lento, mas aumenta o tamanho da imagem com base no uso do VM com o limite sendo o tamanho da criação;
+  * `[IMAGE-NAME]`: Este comando terminará com um arquivo de imagem, e aqui está o nome que atribuímos; sinta-se à vontade para atribuir o nome que desejar;
+  * `15G`: O tamanho da imagem
+
+Neste tutorial, recomendo usar qcow2 com 10 ou 15GB.
+
+Observe que se você estiver usando um esquema de partição como `btrfs` é uma boa ideia desabilitar o recurso COW {% include cite.html id="nocowFlag" %} pois ele se torna um fardo pesado para o seu sistema, e para isso você tem duas opções:
+{: .warning}
+
+1. desabilitando-o por pasta (desabilite-o para todas as suas imagens QEMU de uma vez por todas):
+
+   ```bash
+   # @HOST
+   chattr +C -R path/to/your/images/folder
+   ```
+
+2. desabilitando-o por imagem:
+
+   Você deve adicionar o `-o nocow=on` sinalizador ao criar a imagem, ou seja
+
+   ```bash
+   # @HOST
+   qemu-img create -f qcow2 -o nocow=on [IMAGE-NAME] 15G
+   ```
+
+Por fim, verifique se está tudo bem com o comando:
+
+```bash
+# @HOST
+file [IMAGE-NAME]
+```
+
+A saída do comando acima, deve ser algo semelhante a `[IMAGE-NAME]: QEMU QCOW Image (v3), 16106127360 bytes`
+
+## Instalando uma distribuição
+
+Em seguida, baixe qualquer imagem de distribuição Linux que você queria usar (recomendo Debian ou Arch Linux {% include cite.html id="installArch" %} {% include cite.html id="installArch2" %},
+mas pode ser qualquer um). Com o arquivo de imagem QEMU criado acima e a ISO da sua distro, siga o comando abaixo:
+
+```bash
+# @HOST
+qemu-system-x86_64 -enable-kvm -cdrom ~/PATH/TO/YOUR_DISTRO_ISO.iso -boot order=d -drive file=[IMAGE-NAME] -m 2G
+```
+
+O comando acima pode ser explicado brevemente como:
+
+* `qemu-system-x86_64`: Queremos ativar um sistema emulado de 64 bits sob o conjunto de instruções x86
+  * `-enable-kvm`: Habilite a virtualização completa usando KVM {% include cite.html id="kernelVM" %};
+  * `-cdrom`: Isso especifica o que deve ir em nosso slot de cd emulado;
+  * `-boot order=d`: Especificador que queremos inicializar a partir do CD-ROM primeiro;
+  * `-drive`: Isso define uma nova unidade no sistema (como seu disco rígido usual) para que possamos especificar nosso arquivo de imagem criado anteriormente usando `-drive file=[NAME]`;
+  * `-m`: tamanho da RAM; geralmente não precisaremos de muito para instalar um sistema, mas sua milhagem pode variar se você precisar compilar algo (em uma VM Gentoo, por exemplo).
+
+Em algumas distribuições, o comando acima falha ou mostra um aviso devido ao `-enable-kvm` parâmetro. Isso pode acontecer devido a um dos seguintes problemas:
+{: .warning}
+
+* Você pode não ter **suporte** KVM em sua máquina; é bem provável que você o **tenha** de fato se o seu processador for novo, mas você pode querer dar uma olhada {% include cite.html id="kvmSupport" %};
+* Você pode não ter o KVM **habilitado** em sua máquina, o que normalmente é feito passando os parâmetros do kernel no boot {% include cite.html id="kernelParameters" %};
+* Ou talvez seu usuário host não faça parte do grupo KVM. Você pode adicioná-lo ao grupo KVM. Por exemplo:
+   `sudo usermod -a -G kvm $USER`.
+
+Se você experimentou qualquer uma das duas últimas opções, você também deve reiniciar sua máquina antes de tentar usar o kvm novamente.
+
+O comando acima iniciará uma VM e montará o arquivo ISO que você baixou nela. Após a conclusão da instalação, ele reiniciará a VM automaticamente.
+{: .success}
+
+Prossiga com a instalação e volte aqui depois de terminar. Para simplificar, **crie um usuário na VM que corresponda ao usuário da máquina host.**
+
+## Inicializando uma VM QEMU
+
+Finalmente, é hora de ligar a máquina, Dê uma olhada no comando abaixo e adapte-o para suas necessidades:
+
+```bash
+# @HOST
+qemu-system-x86_64 -enable-kvm -nic user,hostfwd=tcp::2222-:22,smb=/PATH/TO/YOUR/SHARED/FOLDER -daemonize -m 2G -smp cores=4,cpus=4 [IMAGE-NAME]
+```
+
+* `qemu-system-x86_64`: Comando que inicia a VM QEMU.
+  * `-nic`: Atalho para especificar as opções de rede e opções de hardware completamente;
+    * `user`: É usado para especificar as configurações de rede do modo de usuário (ou seja, não deveríamos precisar configurar a rede na VM além de algumas noções básicas);
+    * `hostfwd`: Podemos configurar um esquema de encaminhamento de porta muito básico para que o host possa se conectar via ssh (veja as páginas man do QEMU para mais detalhes);
+    * `smb`: Aqui podemos especificar uma pasta a ser compartilhada usando o cliente samba interno do QEMU (você não deve precisar disso se já tiver uma configuração de samba adequada!);
+  * `-daemonize`: Daemonize o processo QEMU após a inicialização;
+  * `-smp`: Simule um sistema SMP com n CPUs.
+
+Este comando irá abrir uma janela com a distribuição recentemente instalada da etapa anterior. Para obter informações detalhadas sobre as opções usadas neste comando, dê uma olhada na página man.
+
+## Configurando SSH
+
+Neste ponto, provavelmente você pode entrar e sair da VM digitando a senha do usuário da VM; isso pode ser complicado durante o trabalho.
+
+Para melhorar sua experiência de trabalho, siga as etapas abaixo para criar uma conexão ssh sem senha, usando um par de chaves RSA.
+
+**Informações:**
+Há muitas maneiras de configurar uma conexão SSH; aqui está uma visão de 1000 pés do processo.
+{: .info}
+
+Primeiro, crie um par de chaves RSA na máquina host (se ainda não houver) com o comando:
+
+```bash
+# @HOST
+ssh-keygen -t rsa # Note: If you want to have a fully passwordless setup just enter blank in this step
+```
+
+Explicar o comando acima está além deste tutorial. Há muitas informações sobre isso na internet {% include cite.html id="sshDo" %}. Após a configuração da chave, você precisa preparar a VM criada recentemente para aceitar conexões ssh. Basta instalar o pacote `openssh` nele (Arch: openssh, Debian:
+openssh-server).
+
+Como você está trabalhando em uma nova instalação, você precisará habilitar temporariamente a autenticação de senha na VM para fazer login na máquina host. Siga os passos abaixo:
+
+1. Na VM: `sudo sed -i 's/#\(PasswordAuthentication\).*/\1 yes/' /etc/ssh/sshd_config`;
+2. Reinicie o serviço: `sudo systemctl restart sshd`.
+
+Agora, faça login na VM com:
+
+```bash
+# @HOST
+ssh -p 2222 127.0.0.1
+```
+
+Observe que o comando acima tentará fazer login na VM usando o nome de usuário do host padrão, que é $USER, portanto, verifique se ele existe nessa máquina.
+{: .warning}
+
+Se tudo funcionar como esperado, neste ponto, você pode acessar o shell da VM. Seguindo em frente, saia da VM e na máquina host digite o seguinte:
+
+```bash
+# @HOST
+ssh-copy-id -p 2222 $USER@127.0.0.1
+```
+
+Tente acessar novamente a VM, abra o arquivo `/etc/ssh/sshd_config`, comente a linha com `PasswordAuthentication`, reinicie o serviço `sshd` e saia da VM. Por fim, teste ssh na VM e você poderá acessar a máquina usando sua chave ssh.
+
+## Compartilhando um diretório com sua máquina local
+
+Estamos perto de ter um ótimo ambiente de desenvolvimento para brincar com o Kernel Linux; agora temos uma configuração final a fazer: compartilhar um diretório entre sua VM e sua máquina host. Nós queremos compartilhar um diretório porque só precisamos usar nossa VM para teste e não para desenvolvimento, ou seja, podemos compilar o kernel em nossa poderosa máquina host e instalá-lo na VM. Para realizar essa tarefa, usamos o mecanismo de compartilhamento fornecido pelo samba.
+
+Primeiro, precisamos instalar os pacotes samba e CIFS em ambos os nossos sistemas. Faça:
+
+### &rarr; ArchLinux
+
+```bash
+# @HOST
+sudo pacman -S samba
+```
+
+### &rarr; Debian
+
+```bash
+# @HOST
+sudo apt install samba cifs-utils
+```
+
+Segundo, inicie a VM e instale os mesmos pacotes.
+
+```bash
+# @HOST
+qemu-system-x86_64 -enable-kvm -nic user,hostfwd=tcp::2222-:22,smb=/PATH/TO/YOUR/SHARED/FOLDER -daemonize -m 2G -smp cores=4,cpus=4 [IMAGE-NAME]
+
+ssh -p 2222 127.0.0.1
+
+# @VM
+sudo pacman -S samba cifs-utils
+# or
+sudo apt install samba cifs-utils
+```
+
+Agora, queremos configurar nossa VM para que o diretório compartilhado seja acessível sob demanda, ou seja, a VM e o host começaram a compartilhar um diretório se o usuário tentar acessar a pasta. Temos que criar uma nova entrada SystemD para fazer isso.
+
+Antes de prosseguirmos, é importante observar que você deve substituir ``USER`` pelo seu nome de usuário.
+
+1. Vamos começar criando o arquivo `home-USER-shared.mount` (por exemplo
+`home-siqueira-shared.mount`) dentro `/etc/systemd/system/` da VM. Adicione o seguinte conteúdo (novamente, substitua `USER` no arquivo):
+
+   ```raw
+   [Unit]
+   Description=Mount Share at boot
+   Requires=systemd-networkd.service
+   After=network-online.target
+   Wants=network-online.target
+
+   [Mount]
+   What=//10.0.2.4/qemu
+   Where=/home/USER/shared
+   Options=vers=3.0,x-systemd.automount,_netdev,x-systemd.device-timeout=10,uid=1000,noperm,credentials=/root/.cifs
+   Type=cifs
+   TimeoutSec=30
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   Você tem que usar o `uid` correto aqui; você pode usar o comando `id YOUR_USER`.
+   {: .info}
+
+2. Além disso, crie outro arquivo chamado `.cifs` na pasta `/root/` com o seguinte conteúdo:
+
+   ```raw
+   username=YOUR_USER_NAME
+   password=ANY_PASSWORD_YOU_WANT
+   ```
+
+3. Temos que atualizar o `/etc/fstab`. No final do arquivo `fstab` adicione a seguinte linha:
+
+   ```raw
+   //10.0.2.4/qemu         /PATH/TO/YOUR/SHARED/FOLDER  cifs    uid=1000,credentials=/root/.cifs,x-systemd.automount,noperm 0 0
+   ```
+
+4. Agora criamos os diretórios compartilhado:
+
+   ```bash
+   # @VM
+   mkdir shared
+   ```
+
+5. Finalmente, temos que habilitar o arquivo de configuração da unidade de montagem que acabamos de escrever:
+
+   ```bash
+   # @VM
+   sudo systemctl enable home-USER-shared.mount
+   sudo systemctl start home-USER-shared.mount
+   ```
+
+6. Tente acessar o diretório compartilhado criado na etapa 4.
+
+   Reinicie sua VM, inicie-a usando o comando mencionado anteriormente, acesse-a via ssh e tente acessar o diretório `shared`. Se tudo funcionar bem, você deverá ver o diretório e os arquivos que compartilhou com sua máquina host.
+
+## Conclusão
+
+Tenha em mente que apenas arranhamos a superfície do QEMU, esta ferramenta fornece muitos recursos e possui outras ferramentas para gerenciar facilmente as VMs. Por fim, siga meu feed para novos tutoriais sobre desenvolvimento QEMU e Linux.
+
+## Agradecimentos
+
+Gostaria de agradecer a Charles Oliveira, Shayenne da Luz Moura, Rodrigo Ribeiro, Matheus Tavares, Melissa Wen e Marcelo Schmitt por suas revisões e contribuições para este tutorial.
+
+## História
+
+1. V1: Liberação
+2. V2: Melhore os destaques
+3. V3: Adicionei as sugestões de Melissa em algumas das etapas
+4. V4: Adicionei as melhorias de Isabella incluindo detalhes do comando QEMU
+
+{% include print_bib.html %}
