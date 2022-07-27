@@ -1,0 +1,461 @@
+---
+layout: post
+categories: others
+title:  "Compilação e instalação do Kernel"
+date:   2019-02-16
+redirect_from: /others/2019/02/16/Kernel-compilation-and-installation
+author: siqueira
+lang: en
+excerpt_separator: <!--end-abstract-->
+---
+
+Neste tutorial, aprenderemos a compilar e instalar o Kernel Linux usando a árvore de Linus Torvalds. Esperamos que você já tenha uma máquina virtual (de preferência QEMU) disponível.
+
+<!--end-abstract-->
+
+{% include add_ref.html id="processWork"
+    title="How the development process works"
+    url="https://www.kernel.org/doc/html/v4.15/process/2.Process.html" %}
+
+{% include add_ref.html id="kernelCompilation"
+    title="Kernel/Traditional compilation"
+    url="https://wiki.archlinux.org/index.php/Kernels/Traditional_compilation" %}
+
+{% include add_ref.html id="initialRamdisk"
+    title="Initial ramdisk"
+    url="https://en.wikipedia.org/wiki/Initramfs" %}
+
+{% include add_ref.html id="initramfsTutorial"
+    title="Practical stuffs about Initramfs"
+    url="http://nairobi-embedded.org/initramfs_tutorial.html" %}
+
+{% include add_ref.html id="theProblem"
+    title="The problem. (Why root= doesn't scale.)"
+    author="Rob Landley"
+    url="https://landley.net/writing/rootfs-intro.html" %}
+
+{% include add_ref.html id="unableToMountFs"
+    title="Running bzImage in QEMU: Unable to mount root fs on unknown-block(0.0)"
+    year="2012"
+    url="https://unix.stackexchange.com/questions/48302/running-bzimage-in-qemu-unable-to-mount-root-fs-on-unknown-block0-0" %}
+
+{% include add_ref.html id="kernelReadme"
+    title="Kernel README"
+    url="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git/tree/README?id=refs/tags/v4.3.3" %}
+
+{% include add_ref.html id="goodQuick"
+    title="Good and quick kernel configuration creation"
+    author="Thorsten Leemhuis"
+    year="2012"
+    url="http://www.h-online.com/open/features/Good-and-quick-kernel-configuration-creation-1403046.html" %}
+
+{% include add_ref.html id="speedupCompilation"
+    title="How to speed up Linux kernel compilation?"
+    author="momersaleem"
+    year="2014"
+    url="https://stackoverflow.com/questions/23279178/how-to-speed-up-linux-kernel-compilation" %}
+
+{% include add_ref.html id="systemd"
+    title="systemd-boot"
+    url="https://wiki.archlinux.org/index.php/systemd-boot#Adding_boot_entries" %}
+
+{% include add_ref.html id="cpio"
+    title="CPIO"
+    url="https://www.gnu.org/software/cpio/manual/html_mono/cpio.html" %}
+
+{% include add_ref.html id="busybox"
+    title="How do I build a Busybox-based system?"
+    url="https://busybox.net/FAQ.html#build_system" %}
+
+{% include add_ref.html id="useQemu"
+    title="Use QEMU to Play with Linux Kernel"
+    author="Rodrigo Siqueira"
+    year="2019"
+    url="https://flusp.ime.usp.br/others/2019/02/15/use-qemu-to-play-with-linux/" %}
+
+## Resumo de comandos
+
+Se você ainda não leu este tutorial, pule esta seção. Eu adicionei esta seção como um resumo para alguém que já leu este tutorial e quer apenas lembrar de um comando específico.
+{: .info}
+
+Segue a lista de comandos empregada neste tutorial:
+
+&rarr; Manipulações do `.config`:
+
+```bash
+# @VM
+zcat /proc/config.gz > .config
+```
+ou
+
+```bash
+# @VM
+cp /boot/config-`uname -r` .config
+```
+
+&rarr; Mude para o arquivo `.config`:
+
+```bash
+# @HOST
+make nconfig # or make menuconfig
+# @VM
+make olddefconfig
+make kvm_guest.config
+make localmodconfig
+```
+
+&rarr; Compilar:
+
+```bash
+# @HOST
+make ARCH=x86_64 -j8
+make modules
+```
+
+&rarr; Instalar:
+
+```bash
+# @VM
+sudo make modules_install
+sudo make headers_install INSTALL_HDR_PATH=/usr
+sudo make install
+```
+
+&rarr; Remover:
+
+```bash
+# @VM
+rm -rf /boot/vmlinuz-[TARGET]
+rm -rf /boot/initrd-[TARGET]
+rm -rf /boot/System-map-[TARGET]
+rm -rf /boot/config-[TARGET]
+rm -rf /lib/modules/[TARGET]
+rm -rf /var/lib/initramfs/[TARGET]
+```
+
+## Observações
+
+Neste tutorial, trabalharemos dentro e fora de uma VM, para simplificar, adicionaremos o seguinte comentário em cima de cada comando:
+
+* `@VM`: Execute o comando dentro da VM.
+* `@HOST`: Execute o comando em sua máquina.
+
+## Introdução
+
+Neste tutorial, veremos como compilar e instalar o Kernel Linux dentro de uma Máquina Virtual (VM) e em um computador. No entanto, 99% das etapas descritas neste tutorial são genéricas para VM e máquina host. A Figura 1 ilustra o fluxo de trabalho completo usando uma VM e a máquina host; observe que usar uma VM é mais seguro e flexível. Se você deseja instalar uma nova versão do kernel em sua distribuição Linux atual, basicamente você tem todos os elementos da Figura 1 em seu computador principal.
+
+{% include add_image.html
+   src="kernel_qemu_workflow2.png"
+   caption="Development workflow" %}
+
+De forma direta, segue o que queremos fazer em cada alvo:
+
+* Host:
+  * Compilar Linux
+  * Codificação
+* VM:
+  * Instalar Linux personalizado
+  * Alterações de teste
+  * Executar qualquer código de teste
+  * Olhar os registros
+
+Vamos nos concentrar na máquina Debian e Arch Linux. Durante os processos de compilação, precisamos de alguns pacotes no sistema; você precisa encontrar os seguintes pacotes: `grub`, `bison`, `flex`, `openssh`, `ncurses`, e `base-devel/build-essential`.
+
+## Escolha suas armas
+
+Atualmente temos múltiplas opções para realizar experimentos com o Kernel Linux. Para simplificar, classifico as abordagens disponíveis em três grandes áreas: **virtualização** , **desktop/laptop** e **dispositivos incorporados**. A técnica de virtualização é uma maneira inofensiva de brincar com o kernel do Linux porque qualquer erro fatal tem poucas consequências. Por exemplo, se você travar todo o sistema, você pode criar outra máquina virtual ou fazer um de seus backups (sim, faça um backup de suas VMs). Experimentos na máquina host (ou seja, seu computador) são empolgantes, mas também mais arriscados. Qualquer problema potencial pode quebrar todo o seu sistema. Por fim, para os dispositivos embarcados, você pode fazer testes em um kit de desenvolvimento (por exemplo, raspberry pi). Para este tutorial, demonstramos como instalar o Linux em uma máquina virtual e em uma máquina host. Tentamos destacar qualquer operação específica feita dentro de uma VM e em uma máquina host.
+
+Para este tutorial, decidimos usar o QEMU para gerenciar nossa VM. Se você quer aprender como fazer a configuração básica com o QEMU, recomendo que leia meu post sobre isso em "[Use Qemu to play with Linux Kernel]({{ site.baseurl }}{% link _posts/tutorials/qemu/2019-02-15-use-qemu-to-play-with-linux.md %})".
+Lembre-se de que você pode seguir as etapas descritas aqui da mesma forma em sua máquina local.
+
+Uma das primeiras coisas a aprender sobre Linux é a pluralidade do projeto; O Linux é composto de vários subprojetos cada um especializado em uma única característica, esses subprojetos são chamados de subsistemas. Normalmente, o(s) mantenedor(es) de cada subsistema é responsável por receber os patches e decidir se os aplica ou recusa. Mais tarde, o mantenedor diz a Linus Torvalds qual branch ele deve puxar. Esta explicação é uma simplificação excessiva do processo; você pode encontrar mais detalhes na documentação {% include cite.html id="processWork" %}. É importante perceber que você precisa descobrir com qual subsistema você pretende contribuir, bem como seu repositório, e trabalhar com base em sua instância do kernel. Por exemplo, se você quer contribuir para o subsistema RISC-V você tem que trabalhar no repositório do Palmer Dabbelt; se você vai ajudar o IIO use o repositório de Jonathan Cameron. Você pode descobrir rapidamente o repositório de destino observando o arquivo MAINTAINERS. Para este tutorial, usaremos o repositório Torvalds.
+
+```git
+git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+```
+
+Existem milhares de forks do Kernel Linux espalhados pela Internet, por exemplo, é fácil encontrar organizações que mantêm sua instância do kernel com suas customizações específicas. Sinta-se à vontade para usá-lo ou qualquer instância que desejar, mas lembre-se de que você pode enfrentar alguns problemas com repositórios não oficiais. Eu sempre recomendo que os novatos usem o git.kernel.org para obter seu código Linux e evitar problemas.
+
+## O super `.config`
+
+O arquivo `.config` contém todas as informações sobre o que deve ser compilado ou não durante o processo de construção. O arquivo `.config` tem três respostas possíveis por alvo: (1) m, (2) y, e (3) n. O caractere “m” significa que o destino será compilado como um
+[modulo](https://en.wikipedia.org/wiki/Loadable_kernel_module); o 'y' e o 'n' designam se o destino será compilado ou não como parte da imagem do Kernel.
+
+Cada distribuição Linux (por exemplo, Arch, Debian e Fedora) geralmente mantém e distribui seu próprio arquivo `.config`. As distribuições `.config` geralmente habilitam a maioria das opções disponíveis (especialmente os drivers de dispositivo) porque precisam ser executadas em uma grande variedade de hardware. Em outras palavras, significa que o kernel instalado em seu computador pode ter vários drivers de dispositivos que você não precisa. No entanto, o importante aqui é: quanto mais opções você habilitou no `.config` arquivo, mais tempo levará para compilar.
+
+Se esta é a primeira vez que você tenta usar sua própria versão compilada do kernel, eu recomendo fortemente que você use a `.config` fornecida pelo seu sistema operacional para aumentar suas chances de sucesso. Posteriormente, você pode expandir a modificação conforme descrevemos neste tutorial.
+
+**Atenção:**
+O arquivo `.config` possui superpoderes, recomendo que invista um tempo para entendê-lo melhor. Além disso, mantenha um backup de seus arquivos `.config` de trabalho, você pode economizar muito tempo tendo um arquivo `.config` confiável.
+{: .warning}
+
+### Obtenha o seu arquivo `.config`
+
+Dependendo da distribuição que você está usando, existem duas opções para obter o `.config` :(1) `/proc` ou (2) `/boot`. Ambos os casos produzem os mesmo resultados, mas nem todas as distribuições habilitam a opção `/proc` (por exemplo, Arch a habilita, mas Debian não). Os comandos abaixo ilustram como obter o `.config` para ambos os casos:
+
+**ATENÇÃO:**
+**Se você for instalar o novo Kernel em sua VM, terá que tirar o `.config` da VM em execução. NÃO TIRE O `.config` arquivo de sua máquina host, caso contrário, você pode falhar ao compilar e instalar sua versão personalizada. Execute este comando dentro do diretório Linux Kernel clonado anteriormente.**
+{: .warning}
+
+1. Obter o `.config` do `/proc`
+
+```bash
+# @VM
+zcat /proc/config.gz > .config
+```
+
+2. Obter o `.config` do `/boot`
+
+```bash
+# @VM
+cp /boot/config-`uname -r` .config
+```
+
+Lembre-se, se você estiver dentro da VM, precisará trazer o `.config` arquivo da VM para a máquina host. No tutorial sobre QEMU, explicamos como compartilhar um diretório entre convidado e host  {% include cite.html id="useQemu" %}.
+
+### Faça suas personalizações
+
+**Atenção:**
+Existe uma regra básica sobre `.config` arquivo: **NUNCA TROQUE À MÃO, SEMPRE USE UMA FERRAMENTA.**
+{: .warning}
+
+Existem várias opções para alterar o arquivo `.config` , vou apresentar duas:
+
+```bash
+# @HOST
+make nconfig
+```
+&rarr; `nconfig` fica assim:
+
+{% include add_image.html
+   src="nconfig.png"
+   caption="nconfig menu"%}
+
+Finalmente, temos o `menuconfig`:
+
+```bash
+# @HOST
+make menuconfig
+```
+
+&rarr; `menuconfig` fica assim:
+
+{% include add_image.html
+   src="menuconfig.png"
+   caption="menuconfig menu"%}
+
+Reserve algum tempo para navegar pelas opções e se familiarizar com este menu. Para este tutorial, queremos apenas fazer uma pequena alteração: substitua o nome do kernel atual. No menu, selecione as seguintes opções: General setup &rarr;
+Local version &rarr; Replace the name. A figura abaixo ilustra as etapas.
+
+{% include add_image.html
+   src="change_name.png"
+   caption="Managing Configuration Changes"%}
+
+### Considerações finais sobre `.config` e dicas
+
+**Atenção:**
+Lembre-se, você tem que trabalhar com o arquivo `.config` certo. Se você estiver na VM, use os comandos descritos aqui **dentro** da VM. Caso contrário, basta usá-lo em sua máquina.
+{: .warning}
+
+Quando você usa um arquivo de configuração fornecido por uma Distribuição, centenas de drivers de dispositivo são habilitados; normalmente, você precisa de alguns drivers. Todos os drivers habilitados aumentarão o tempo de compilação, e não queremos isso; felizmente, existe uma opção que altera automaticamente o `.config` para habilitar apenas os drivers necessários para o seu sistema. Este comando examina todos os módulos carregados em seu sistema e com base nesta informação ele reduz o arquivo `.config`  (este comando usa `lsmod` para habilitar ou desabilitar drivers de dispositivos no arquivo `.config`) No entanto, antes de usar este comando, é altamente recomendável habilitar todos os dispositivos que você usa com seu computador para garantir que o `.config` tenha todos os drivers necessários para sua máquina {% include cite.html id="goodQuick" %}. Em outras palavras, conecte todos os dispositivos você costuma usar antes de executar o comando:
+
+```bash
+# @VM
+make localmodconfig
+```
+
+**Lembre-se:**
+Antes de executar `make localmodconfig`, conecte todos os dispositivos que você costuma usar para habilitá-los no `.config`. No entanto, essas etapas de plug-in são necessárias apenas se você estiver em sua máquina host; você não precisa se preocupar com isso em sua VM, basta executar o comando.
+{: .notice_info}
+
+Às vezes, quando você faz o rebase de seu branch local com o upstream e inicia a compilação, você pode notar perguntas interativas sobre novos recursos. Algo parecido com a figura abaixo:
+
+{% include add_image.html
+   src="questions.png"
+   caption="Interactive questions"%}
+
+Isso acontece porque durante a evolução do Kernel novos recursos são acrescentados, e esses novos recursos não estavam presentes em seu arquivo `.config`. Como resultado, você é solicitado a tomar uma decisão sobre o que fazer com esses novos recursos. Uma maneira de reduzir a quantidade de interação é:
+
+```bash
+# @VM
+make olddefconfig
+```
+
+Finalmente, uma última dica para todos que estão trabalhando com QEMU e KVM. Existe uma opção que habilita alguns recursos para este cenário:
+
+```bash
+# @VM
+make kvm_guest.config
+```
+
+## Compilar!
+
+Agora, é a hora! Depois de um monte de configurações, tenho certeza de que você está ansioso para esta parte. Então vamos lá... digite:
+
+```bash
+# @HOST
+make -j [numbers_of_threads]
+```
+
+O parâmetro `number_of_threads` deve ser substituído pelo número desejado de threads a serem gerados para compilação. Você deve usar o valor que maximiza o uso de sua CPU, para obter uma compilação mais rápida.
+
+Como alternativa, você pode especificar a arquitetura
+{% include cite.html id="speedupCompilation" %}:
+
+```bash
+# @HOST
+make ARCH=x86_64 -j [numbers_of_threads]
+```
+
+Para compilar os módulos do kernel, digite:
+
+```bash
+# @HOST
+make modules
+```
+
+## Instale seu Kernel personalizado
+
+É importante prestar atenção na ordem de instalação:
+
+1. Instalar módulos
+2. Instalar cabeçalho
+3. Install imagem
+4. Atualizar carregador de inicialização (Grub)
+
+### Instalar módulos e cabeçalhos
+
+**Zona perigosa:**
+De agora em diante, dobre sua atenção nas etapas de instalação. Você pode travar seu sistema.
+{: .error}
+
+Para instalar os módulos, digite:
+
+```bash
+# @VM
+sudo make modules_install
+```
+
+Se você quiser verificar as mudanças, dê uma olhada em `/lib/modules/$(uname -r)`
+
+Esta próxima etapa é opcional e, geralmente, necessária apenas se você fizer algumas alterações nos recursos principais do kernel. Se você estiver trabalhando com módulos, não precisará dessa etapa; finalmente, **se esta for sua primeira instalação, pule o próximo comando**:
+
+```bash
+# @VM
+sudo make headers_install INSTALL_HDR_PATH=/usr
+```
+
+Finalmente, é hora de instalar sua imagem do Kernel. Esta etapa depende da distribuição Linux que você está usando. Mostraremos como instalar sua nova imagem de kernel no Debian e ArchLinux.
+
+### &rarr; Etapas baseadas no Debian
+
+Para instalar o Kernel no Debian, basta digitar:
+
+```bash
+# @VM
+sudo make install
+```
+
+Vá para seção grub
+
+### &rarr;  Etapas baseadas no Arch Linux
+
+Se você usa ArchLinux, apresentamos as etapas básicas para instalar sua imagem personalizada. Você pode encontrar uma explicação detalhada desses processos no
+[wiki](https://wiki.archlinux.org/index.php/Kernels/Traditional_compilation) do ArchLinux.
+
+Primeiro, você deve fazer uma cópia da sua imagem do kernel para o `/boot/` diretório com o comando:
+
+```bash
+# @VM
+sudo cp -v arch/x86_64/boot/bzImage /boot/vmlinuz-[NAME]
+```
+
+Substitua `[NAME]` pelo mesmo nome que você configurou para o seu kernel nas etapas mencionadas anteriormente - na verdade, você pode usar qualquer nome que desejar, apenas recomendo que você use o mesmo nome para manter as coisas organizadas. Lembre-se, você pode usar o nome que quiser.
+
+Em segundo lugar, você precisa criar um novo arquivo `mkinitcpio`. Siga os passos abaixo:
+
+1. Copiar um `mkinitcpio` existente.
+
+```bash
+# @VM
+sudo cp /etc/mkinitcpio.d/linux.preset /etc/mkinitcpio.d/linux-[NAME].preset
+```
+
+2. Abra o arquivo copiado, olhe linha por linha, substitua o nome do kernel antigo pelo novo nome que você atribuiu quando substituiu `[NAME]` ( **deve ser o mesmo que você usou quando copiou a imagem compilada para `/boot`**). No exemplo abaixo, usamos `[NAME]` como torvalds:
+
+```
+# @VM
+# mkinitcpio preset file for the 'linux' package
+
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-torvalds"
+
+PRESETS=('default' 'fallback')
+
+#default_config="/etc/mkinitcpio.conf"
+default_image="/boot/initramfs-torvalds.img"
+#default_options=""
+
+#fallback_config="/etc/mkinitcpio.conf"
+fallback_image="/boot/initramfs-torvalds-fallback.img"
+fallback_options="-S autodetect"
+```
+
+**Atenção:**
+Tenha em mente que você mesmo deve adaptar este arquivo. Não faça cópia e cola cegas aqui.
+{: .warning}
+
+3. Gere o initramfs {% include cite.html id="kernelCompilation" %}
+{% include cite.html id="initialRamdisk" %}:
+
+```bash
+# @VM
+sudo mkinitcpio -p linux-[name]
+```
+
+**Atenção:**
+Atenção: Você precisa criar um `mkinitcpio.conf` por kernel que deseja instalar. Se você continuar atualizando sua imagem do kernel, não precisará criar um novo arquivo de configuração.
+{: .warning}
+
+
+## Atualizar o Grub2
+
+Estamos realmente muito perto de terminar a instalação. Nós apenas temos que atualizar o bootloader com o seguinte comando:
+
+```bash
+# @VM
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+Agora, reinicie seu sistema e verifique se está tudo ok. Você deve ver algumas opções em seu Grub como a Figura 6 abaixo ilustra.
+
+{% include add_image.html
+   src="grub_vm.png"
+   caption="Grub menu options"%}
+
+## Remover
+
+Finalmente, você pode querer remover uma versão antiga do Kernel por motivos de espaço ou organização. Antes de tudo, inicialize em outra versão do Kernel e siga os passos abaixo:
+
+```bash
+# @VM
+rm -rf /boot/vmlinuz-[target]
+rm -rf /boot/initrd-[target]
+rm -rf /boot/System-map-[target]
+rm -rf /boot/config-[target]
+rm -rf /lib/modules/[target]
+rm -rf /var/lib/initramfs/[target]
+```
+
+## Agradecimentos
+
+Gostaria de agradecer a Charles Oliveira, Matheus Tavares e Marcelo Schmitt por suas revisões e contribuições para este tutorial.
+
+## History
+
+1. V1: Liberação
+  - Revisado por: Matheus Tavares and Marcelo Schmitt
+2. V2: Melhore os destaques
+3. V3: Atualizar rótulos de figuras, Figura 4 e citação
+
+{% include print_bib.html %}
